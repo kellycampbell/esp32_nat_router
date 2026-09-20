@@ -27,6 +27,24 @@ menu "WiFi Repeater"
             When disabled, the firmware behaves as a traditional NAT
             router (NAPT + AP-side DHCPS).
 
+    config HALOW_UPLINK
+        bool "Use a Wi-Fi HaLow transceiver as the upstream link"
+        default n
+        help
+            Drive the upstream side of the bridge from a Morse Micro Wi-Fi
+            HaLow transceiver (802.11ah, sub-GHz) instead of the native
+            Wi-Fi STA. The native radio then runs AP-only for downstream
+            clients, so the two sides no longer share a radio and the AP is
+            free of the channel-lock constraint.
+
+            Requires the morsemicro/halow managed component and a board
+            profile supplying the SPI pin map, chip variant and BCF file.
+            See sdkconfig.defaults.halow.
+
+            Note that the HaLow side supports only open, OWE and WPA3-SAE
+            security; WPA2-PSK and WPA2-Enterprise are not available on the
+            uplink in this mode.
+
 endmenu
 
 menu "MQTT Home Assistant"

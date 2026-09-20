@@ -1,0 +1,54 @@
+# Wi-Fi HaLow uplink build overlay.
+#
+# Layered on top of sdkconfig.defaults. It must ALSO be layered with a Morse
+# Micro board profile, which supplies the SPI/GPIO pin map, the chip variant
+# (CONFIG_MM_CHIP_*) and the BCF filename (CONFIG_MM_BCF_FILE). Without a board
+# profile the morsemicro/halow firmware component fails the build by design.
+# Profiles ship in:
+#   managed_components/morsemicro__halow/configs/sdkconfig.defaults.<board>-<hat>
+#
+# ESP-IDF:
+#   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.halow;\
+#   managed_components/morsemicro__halow/configs/sdkconfig.defaults.seeed_xiao_esp32s3-seeed_xiao_mm6108" \
+#       idf.py set-target esp32s3
+#
+# PlatformIO: pioarduino passes -DSDKCONFIG but never -DSDKCONFIG_DEFAULTS, and
+# its custom_sdkconfig option is Arduino-framework-only, so the env layers this
+# file by setting the SDKCONFIG_DEFAULTS environment variable from a pre-script:
+#   extra_scripts = pre:scripts/halow_sdkconfig.py
+#   custom_halow_profile = managed_components/morsemicro__halow/configs/...
+#
+# ".halow" is not an IDF target name, so unlike sdkconfig.defaults.esp32s3 this
+# file is never picked up automatically — it has to be named explicitly.
+# ESP-IDF does still auto-append "<entry>.<target>" per entry, so a
+# sdkconfig.defaults.halow.esp32s3 would layer on top of this one.
+
+# --- Uplink selection -------------------------------------------------------
+# Drive the repeater's upstream link from the HaLow transceiver instead of the
+# native Wi-Fi STA. The native radio stays AP-only, serving downstream clients.
+CONFIG_HALOW_UPLINK=y
+
+# --- Flash layout -----------------------------------------------------------
+# Overrides the 4 MB / partitions_example.csv defaults. The HaLow stack embeds
+# ~480 KB of transceiver firmware plus a BCF blob in the app image, which does
+# not fit the 1536 K OTA slots of the standard table.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_8mb.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_8mb.csv"
+
+# --- Morse Micro HaLow stack ------------------------------------------------
+CONFIG_WIFI_HALOW=y
+
+# Regulatory domain. The transceiver refuses to boot on the "??" default, so a
+# real region is required at build time even though the firmware re-applies the
+# NVS-configured country at runtime via mmwlan_set_channel_list().
+CONFIG_HALOW_COUNTRY_CODE="US"
+
+# Power save off: a bridge has to stay RX-ready continuously, mirroring the
+# esp_wifi_set_ps(WIFI_PS_NONE) the repeater already does for the native radio.
+CONFIG_HALOW_PS_MODE=n
+
+# HaLow AP mode costs flash and RAM and is unused while HaLow is the uplink.
+CONFIG_HALOW_AP_MODE=n

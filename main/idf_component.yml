@@ -1,3 +1,4 @@
 dependencies:
   espressif/led_strip: '*'
   espressif/mdns: '*'
+  morsemicro/halow: "==2.11.2-esp32-2"
