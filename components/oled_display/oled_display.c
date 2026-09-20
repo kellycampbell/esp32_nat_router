@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "esp_netif_ip_addr.h"
 #include "esp_wifi.h"
+#include "uplink.h"
 #include "lwip/ip4_addr.h"
 
 /* Extern router globals (avoid including router_globals.h to prevent circular deps) */
@@ -280,8 +281,8 @@ static void render_status(int page)
             format_ip(ipbuf, sizeof(ipbuf), my_ip);
             fb_draw_string(6, ipbuf);
 
-            wifi_ap_record_t ap_info;
-            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            uplink_ap_record_t ap_info;
+            if (uplink_get_ap_info(&ap_info)) {
                 snprintf(line, sizeof(line), "%ddB C:%u  2/2", ap_info.rssi, (unsigned)connect_count);
             } else {
                 snprintf(line, sizeof(line), "UP C:%u  2/2", (unsigned)connect_count);
@@ -299,8 +300,8 @@ static void render_status(int page)
     fb_draw_string(0, ap_ssid != NULL ? ap_ssid : "NO AP");
 
     if (ap_connect) {
-        wifi_ap_record_t ap_info;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        uplink_ap_record_t ap_info;
+        if (uplink_get_ap_info(&ap_info)) {
             snprintf(line, sizeof(line), "UP %ddBm", ap_info.rssi);
         } else {
             snprintf(line, sizeof(line), "UP");

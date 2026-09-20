@@ -18,6 +18,7 @@
 #include "lwip/inet.h"
 
 #include <esp_wifi.h>
+#include "uplink.h"
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_system.h>
@@ -711,7 +712,7 @@ static inline void resume_sta_if_scan_idle(void)
     if (wifi_scan_active) {
         wifi_scan_active = false;
         if (!ap_connect) {
-            esp_wifi_connect();
+            uplink_connect();
         }
     }
 }
@@ -1231,8 +1232,8 @@ static esp_err_t index_get_handler(httpd_req_t *req)
 
     /* Stream Uplink row */
     if (ap_connect) {
-        wifi_ap_record_t ap_info;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        uplink_ap_record_t ap_info;
+        if (uplink_get_ap_info(&ap_info)) {
             snprintf(row, sizeof(row), "<tr><td>Uplink:</td><td><strong>Connected (%d dBm)</strong></td></tr>", ap_info.rssi);
             SEND_CHUNK(req, row, HTTPD_RESP_USE_STRLEN);
         } else {
@@ -1820,7 +1821,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
     char sta_mac_str[18] = "";
-    if (esp_wifi_get_mac(ESP_IF_WIFI_STA, mac) == ESP_OK) {
+    if (uplink_get_mac(mac)) {
         sprintf(sta_mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
@@ -2864,6 +2865,16 @@ static const char* web_auth_mode_to_str(wifi_auth_mode_t authmode)
     }
 }
 
+/* A HaLow probe response carries only the Privacy bit, not an authmode, so the
+ * scan table falls back to a coarse label there. */
+static const char* web_security_to_str(const uplink_ap_record_t *ap)
+{
+    if (ap->authmode == WIFI_AUTH_MAX) {
+        return ap->secure ? "WPA3-SAE" : "Open";
+    }
+    return web_auth_mode_to_str(ap->authmode);
+}
+
 /* URL encode a string for use in query parameters */
 static void url_encode(const char *src, char *dst, size_t dst_len)
 {
@@ -2895,8 +2906,8 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
     bool password_protection_enabled = is_web_password_set();
     bool can_connect = !password_protection_enabled || is_authenticated(req);
 
-    uint16_t ap_count = 0;
-    wifi_ap_record_t *ap_list = NULL;
+    int ap_count = 0;
+    uplink_ap_record_t *ap_list = NULL;
     bool scan_in_progress = false;
     int refresh_time = 15;  /* Default refresh interval */
 
@@ -2906,32 +2917,17 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
     }
 
     /* Try to get existing scan results first */
-    esp_err_t err = esp_wifi_scan_get_ap_num(&ap_count);
-
-    if (err == ESP_OK && ap_count > 0) {
-        /* We have results from a previous scan — read them */
-        if (ap_count > 20) ap_count = 20;
-        ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
-        if (ap_list != NULL) {
-            esp_wifi_scan_get_ap_records(&ap_count, ap_list);
-        } else {
-            ap_count = 0;
-        }
+    ap_list = malloc(sizeof(uplink_ap_record_t) * UPLINK_SCAN_MAX);
+    if (ap_list != NULL) {
+        ap_count = uplink_scan_get_results(ap_list, UPLINK_SCAN_MAX);
     }
 
     /* Start a (new) background scan for the next refresh */
-    wifi_scan_config_t scan_config = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = true,
-        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-    };
     if (!ap_connect) wifi_scan_active = true;
-    err = esp_wifi_scan_start(&scan_config, false);  /* Non-blocking */
+    esp_err_t err = uplink_scan_start(false);
 
     if (ap_count == 0) {
-        if (err == ESP_OK || err == ESP_ERR_WIFI_STATE) {
+        if (err == ESP_OK || err == ESP_ERR_WIFI_STATE || err == ESP_ERR_INVALID_STATE) {
             /* No previous results, scan just started */
             scan_in_progress = true;
             refresh_time = 2;  /* Quick refresh to get results */
@@ -2985,7 +2981,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
             }
 
             /* HTML-escape SSID for display */
-            char *safe_ssid = html_escape((const char *)ap_list[i].ssid);
+            char *safe_ssid = html_escape(ap_list[i].ssid);
             if (safe_ssid == NULL) {
                 safe_ssid = strdup("(unknown)");
             }
@@ -2994,7 +2990,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
             char connect_cell[256] = "";
             if (can_connect) {
                 char encoded_ssid[128];
-                url_encode((const char *)ap_list[i].ssid, encoded_ssid, sizeof(encoded_ssid));
+                url_encode(ap_list[i].ssid, encoded_ssid, sizeof(encoded_ssid));
                 snprintf(connect_cell, sizeof(connect_cell),
                     "<td><a href='/setup?ssid=%s' class='connect-button'>Connect</a></td>",
                     encoded_ssid);
@@ -3021,11 +3017,19 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
 
             /* Channel / band info */
             char ch_info[80];
-#if WIFI_HAS_5GHZ
+#if CONFIG_HALOW_UPLINK
+            /* S1G has no channel number in the probe response, so show the
+             * centre frequency and operating bandwidth instead. */
+            snprintf(ch_info, sizeof(ch_info),
+                     "%lu.%02lu <span style='color:#888;font-size:0.75rem;'>MHz/%uM</span>",
+                     (unsigned long)(ap_list[i].freq_khz / 1000),
+                     (unsigned long)((ap_list[i].freq_khz % 1000) / 10),
+                     (unsigned)ap_list[i].bw_mhz);
+#elif WIFI_HAS_5GHZ
             snprintf(ch_info, sizeof(ch_info), "%d <span style='color:#888;font-size:0.75rem;'>%s</span>",
-                     ap_list[i].primary, ap_list[i].primary > 14 ? "5G" : "2.4G");
+                     ap_list[i].channel, ap_list[i].channel > 14 ? "5G" : "2.4G");
 #else
-            snprintf(ch_info, sizeof(ch_info), "%d", ap_list[i].primary);
+            snprintf(ch_info, sizeof(ch_info), "%d", ap_list[i].channel);
 #endif
 
             html_offset += snprintf(scan_html + html_offset, sizeof(scan_html) - html_offset,
@@ -3039,7 +3043,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
                 safe_ssid,
                 signal_bars_html, rssi,
                 ch_info,
-                web_auth_mode_to_str(ap_list[i].authmode),
+                web_security_to_str(&ap_list[i]),
                 connect_cell
             );
 

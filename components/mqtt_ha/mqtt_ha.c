@@ -19,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "uplink.h"
 #include "esp_system.h"
 #include "esp_console.h"
 #include "argtable3/argtable3.h"
@@ -439,12 +440,12 @@ static void publish_state(void *arg)
     if (!s_connected) return;
 
     /* Get uplink info (RSSI + SSID) */
-    wifi_ap_record_t ap_info;
+    uplink_ap_record_t ap_info;
     int8_t rssi = 0;
-    char uplink_ssid[33] = "";
-    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+    char uplink_ssid[UPLINK_SSID_MAXLEN] = "";
+    if (uplink_get_ap_info(&ap_info)) {
         rssi = ap_info.rssi;
-        strncpy(uplink_ssid, (const char *)ap_info.ssid, sizeof(uplink_ssid));
+        strlcpy(uplink_ssid, ap_info.ssid, sizeof(uplink_ssid));
     }
 
     /* Router-level state */

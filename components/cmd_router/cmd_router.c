@@ -25,6 +25,7 @@
 #include "sdkconfig.h"
 #include "nvs.h"
 #include "esp_wifi.h"
+#include "uplink.h"
 
 #include "lwip/ip4_addr.h"
 #if !IP_NAPT
@@ -1216,15 +1217,18 @@ static int show(int argc, char **argv)
 
         // Connection status
         if (ap_connect) {
-            wifi_ap_record_t ap_info;
-            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-#if WIFI_HAS_5GHZ
+            uplink_ap_record_t ap_info;
+            if (uplink_get_ap_info(&ap_info)) {
+#if CONFIG_HALOW_UPLINK
+                printf("Uplink HaLow: connected to %s (%d dBm)\n",
+                       ap_info.ssid[0] ? ap_info.ssid : "(unknown)", ap_info.rssi);
+#elif WIFI_HAS_5GHZ
                 printf("Uplink STA: connected (ch %d, %s, %d dBm)\n",
-                       ap_info.primary,
-                       ap_info.primary > 14 ? "5 GHz" : "2.4 GHz",
+                       ap_info.channel,
+                       ap_info.channel > 14 ? "5 GHz" : "2.4 GHz",
                        ap_info.rssi);
 #else
-                printf("Uplink STA: connected (ch %d, %d dBm)\n", ap_info.primary, ap_info.rssi);
+                printf("Uplink STA: connected (ch %d, %d dBm)\n", ap_info.channel, ap_info.rssi);
 #endif
             } else {
                 printf("Uplink AP: connected\n");
@@ -3284,67 +3288,66 @@ static const char* auth_mode_to_str(wifi_auth_mode_t authmode)
 /* 'scan' command implementation */
 static int scan_cmd(int argc, char **argv)
 {
-    wifi_scan_config_t scan_config = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = true,
-        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-    };
-
     /* Stop connection attempts so they don't interfere with scanning */
     if (!ap_connect) {
         wifi_scan_active = true;
-        esp_wifi_disconnect();
+        uplink_disconnect();
         vTaskDelay(pdMS_TO_TICKS(100));  /* Let disconnect complete */
     }
 
-    printf("Scanning for WiFi networks...\n");
-    esp_err_t err = esp_wifi_scan_start(&scan_config, true);  /* Blocking scan */
+    printf("Scanning for networks...\n");
+    esp_err_t err = uplink_scan_start(true);  /* Blocking scan */
 
     /* Read results BEFORE clearing flag or reconnecting, so nothing
      * can interfere with the scan result buffer. */
-    uint16_t ap_count = 0;
-    wifi_ap_record_t *ap_list = NULL;
-
-    if (err == ESP_OK) {
-        esp_wifi_scan_get_ap_num(&ap_count);
-        if (ap_count > 0) {
-            ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
-            if (ap_list != NULL) {
-                esp_wifi_scan_get_ap_records(&ap_count, ap_list);
-            } else {
-                ap_count = 0;
-            }
-        }
+    int ap_count = 0;
+    uplink_ap_record_t *ap_list = malloc(sizeof(uplink_ap_record_t) * UPLINK_SCAN_MAX);
+    if (err == ESP_OK && ap_list != NULL) {
+        ap_count = uplink_scan_get_results(ap_list, UPLINK_SCAN_MAX);
     }
 
     /* Now safe to resume connection attempts */
     wifi_scan_active = false;
     if (!ap_connect) {
-        esp_wifi_connect();
+        uplink_connect();
     }
 
     if (err != ESP_OK) {
+        free(ap_list);
         printf("Scan failed: %s\n", esp_err_to_name(err));
         return 1;
     }
 
     if (ap_count == 0) {
+        free(ap_list);
         printf("No networks found.\n");
         return 0;
     }
 
     /* Print header */
     printf("\nFound %d networks:\n", ap_count);
-#if WIFI_HAS_5GHZ
+#if CONFIG_HALOW_UPLINK
+    /* S1G probe responses carry a centre frequency and bandwidth rather than a
+     * channel number, and only a Privacy bit rather than an authmode. */
+    printf("%-32s  %9s  %3s  %4s  %-12s\n", "SSID", "Freq(MHz)", "BW", "RSSI", "Security");
+    printf("--------------------------------  ---------  ---  ----  ------------\n");
+
+    for (int i = 0; i < ap_count; i++) {
+        printf("%-32s  %6lu.%02lu  %2uM  %4d  %s\n", ap_list[i].ssid,
+               (unsigned long)(ap_list[i].freq_khz / 1000),
+               (unsigned long)((ap_list[i].freq_khz % 1000) / 10),
+               (unsigned)ap_list[i].bw_mhz,
+               ap_list[i].rssi,
+               ap_list[i].secure ? "WPA3-SAE" : "Open");
+    }
+#elif WIFI_HAS_5GHZ
     printf("%-32s  %3s  %5s  %4s  %-12s\n", "SSID", "Ch", "Band", "RSSI", "Security");
     printf("--------------------------------  ---  -----  ----  ------------\n");
 
     for (int i = 0; i < ap_count; i++) {
         const char *auth = auth_mode_to_str(ap_list[i].authmode);
-        printf("%-32s  %3d  %5s  %4d  %s\n", ap_list[i].ssid, ap_list[i].primary,
-               ap_list[i].primary > 14 ? "5 GHz" : "2.4 G", ap_list[i].rssi, auth);
+        printf("%-32s  %3d  %5s  %4d  %s\n", ap_list[i].ssid, ap_list[i].channel,
+               ap_list[i].channel > 14 ? "5 GHz" : "2.4 G", ap_list[i].rssi, auth);
     }
 #else
     printf("%-32s  %3s  %4s  %-12s\n", "SSID", "Ch", "RSSI", "Security");
@@ -3352,7 +3355,7 @@ static int scan_cmd(int argc, char **argv)
 
     for (int i = 0; i < ap_count; i++) {
         const char *auth = auth_mode_to_str(ap_list[i].authmode);
-        printf("%-32s  %3d  %4d  %s\n", ap_list[i].ssid, ap_list[i].primary, ap_list[i].rssi, auth);
+        printf("%-32s  %3d  %4d  %s\n", ap_list[i].ssid, ap_list[i].channel, ap_list[i].rssi, auth);
     }
 #endif
 

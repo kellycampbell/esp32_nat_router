@@ -55,6 +55,7 @@
 #include "lwip/lwip_napt.h"
 
 #include "router_globals.h"
+#include "uplink.h"
 #include "lwip/ip_addr.h"
 #include "esp_netif.h"
 #include "client_stats.h"
@@ -462,7 +463,17 @@ static void wifi_connect_band_aware(void)
 
 static inline void sta_connect(void)
 {
-#if WIFI_HAS_5GHZ
+#if CONFIG_HALOW_UPLINK
+    /* No band selection on the sub-GHz uplink, and no WIFI_EVENT_STA_START to
+     * kick things off — the caller drives every attempt explicitly. */
+    if (ssid == NULL || ssid[0] == '\0') {
+        return;
+    }
+    esp_err_t err = uplink_halow_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "HaLow connect failed: %s", esp_err_to_name(err));
+    }
+#elif WIFI_HAS_5GHZ
     wifi_connect_band_aware();
 #else
     esp_wifi_connect();
@@ -505,6 +516,33 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
     esp_netif_dns_info_t dns;
+
+#if CONFIG_HALOW_UPLINK
+    if (event_base == UPLINK_EVENT)
+    {
+        if (event_id == UPLINK_EVENT_CONNECTED) {
+            /* The Morse link-state callback has already driven
+             * esp_netif_action_connected(), so the DHCP client is running and
+             * IP_EVENT_STA_GOT_IP will follow. Nothing to do but stop the
+             * retry timer. */
+            ESP_LOGI(TAG, "HaLow uplink associated, waiting for DHCP");
+            esp_timer_stop(sta_reconnect_timer);
+        } else if (event_id == UPLINK_EVENT_DISCONNECTED) {
+            ESP_LOGI(TAG, "HaLow uplink down - retry to connect to the AP");
+            ap_connect = false;
+            /* A scan drops the association on purpose; reconnecting here would
+             * fight the scan for the radio. The scan path clears the flag and
+             * reconnects when it is done, as it does on the native STA. */
+            if (wifi_scan_active) {
+                ESP_LOGI(TAG, "scan in progress - deferring reconnect");
+            } else {
+                sta_schedule_reconnect();
+            }
+            xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        }
+        return;
+    }
+#endif
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
@@ -559,10 +597,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         // Initialize byte counter after getting IP (interface is ready)
         init_byte_counter();
 
-#if CONFIG_REPEATER_MODE
+#if CONFIG_REPEATER_MODE && !CONFIG_HALOW_UPLINK
         /* Pin the AP to the STA's current channel. With APSTA the driver
          * usually aligns them, but make it explicit so the bridge can never
-         * end up with the two interfaces on different channels. */
+         * end up with the two interfaces on different channels. With a HaLow
+         * uplink the two sides are separate radios, so the AP picks its own
+         * channel freely and this block is skipped. */
         {
             uint8_t prim = 0;
             wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
@@ -661,13 +701,22 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 void ap_set_enabled(bool enabled)
 {
     if (enabled) {
+#if CONFIG_HALOW_UPLINK
+        esp_wifi_set_mode(WIFI_MODE_AP);
+#else
         esp_wifi_set_mode(WIFI_MODE_APSTA);
+#endif
 #if !CONFIG_REPEATER_MODE
         if (ap_nat_enabled) ip_napt_enable(my_ap_ip, 1);
 #endif
     } else {
         connect_count = 0;
+#if CONFIG_HALOW_UPLINK
+        /* Nothing left for the native radio to do once the AP is off. */
+        esp_wifi_set_mode(WIFI_MODE_NULL);
+#else
         esp_wifi_set_mode(WIFI_MODE_STA);
+#endif
     }
     ap_disabled = !enabled;
     set_config_param_int("ap_disabled", ap_disabled ? 1 : 0);
@@ -693,7 +742,17 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
     esp_netif_init();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifiAP = esp_netif_create_default_wifi_ap();
+#if CONFIG_HALOW_UPLINK
+    /* The HaLow component registers its own netif under the "WIFI_STA_DEF"
+     * ifkey, so the native STA netif must not be created as well — the keys
+     * would collide and the bridge would hook the wrong interface. */
+    wifiSTA = uplink_halow_init();
+    if (wifiSTA == NULL) {
+        ESP_LOGE(TAG, "HaLow uplink init failed; continuing AP-only");
+    }
+#else
     wifiSTA = esp_netif_create_default_wifi_sta();
+#endif
 
     // Set DHCP client hostname (Option 12)
     esp_netif_set_hostname(wifiSTA, hostname);
@@ -740,6 +799,16 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
                                                         &wifi_event_handler,
                                                         NULL,
                                                         &instance_got_ip));
+#if CONFIG_HALOW_UPLINK
+    {
+        esp_event_handler_instance_t instance_uplink;
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(UPLINK_EVENT,
+                                                            ESP_EVENT_ANY_ID,
+                                                            &wifi_event_handler,
+                                                            NULL,
+                                                            &instance_uplink));
+    }
+#endif
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -763,6 +832,21 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
 	    strlcpy((char*)ap_config.sta.password, ap_passwd, sizeof(ap_config.sta.password));
     }
 
+#if CONFIG_HALOW_UPLINK
+    /* The native radio is downstream-only: the uplink lives on the HaLow
+     * transceiver, so there is no native STA to keep alive. */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(ap_disabled ? WIFI_MODE_NULL : WIFI_MODE_AP));
+
+    if (strlen(ssid) > 0) {
+        esp_err_t halow_err = uplink_halow_set_config(ssid, passwd);
+        if (halow_err != ESP_OK) {
+            ESP_LOGE(TAG, "HaLow uplink config rejected: %s", esp_err_to_name(halow_err));
+        }
+    }
+    (void)mac;
+    (void)ent_username;
+    (void)ent_identity;
+#else
     // Always use APSTA mode so WiFi scanning works even without an uplink configured
     ESP_ERROR_CHECK(esp_wifi_set_mode(ap_disabled ? WIFI_MODE_STA : WIFI_MODE_APSTA));
 
@@ -809,6 +893,7 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
             ESP_ERROR_CHECK(esp_wifi_set_mac(ESP_IF_WIFI_STA, mac));
         }
     }
+#endif /* CONFIG_HALOW_UPLINK */
 
     if (!ap_disabled) {
         ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &ap_config));
@@ -864,6 +949,15 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
      * available. Disable WiFi modem sleep so the radio stays awake while
      * the bridge forwards frames between STA and AP. */
     esp_wifi_set_ps(WIFI_PS_NONE);
+#endif
+
+#if CONFIG_HALOW_UPLINK
+    /* There is no WIFI_EVENT_STA_START on the HaLow side, so the first
+     * association attempt has to be made here. Retries then run off the same
+     * backoff timer the native path uses. */
+    if (strlen(ssid) > 0) {
+        sta_connect();
+    }
 #endif
 
     if (strlen(ssid) > 0) {

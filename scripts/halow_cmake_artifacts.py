@@ -19,6 +19,15 @@ such steps:
     IMPORTED library. SCons links (and ldgen reads) that path, so a build
     without it fails in ldgen with "libmorse.a: No such file".
 
+The IMPORTED target has a second consequence: pioarduino builds its link list
+from the CMake file API, which reports real library targets but not the
+IMPORTED_LOCATION of imported ones. libmorse.a and the two archives reachable
+only through morselib's INTERFACE link libraries (mmpktmem, mmutils) are
+therefore absent from the link. That goes unnoticed while nothing references
+mmhalow.c -- it sits unextracted in libmorsemicro__halow.a -- and turns into a
+wall of undefined mmwlan_*/mmpkt_* symbols the moment the application calls
+into the HaLow API. So this script also appends those archives to LIBS.
+
 This runs as a post: script, which is still SConscript-evaluation time: the
 CMake project has been configured and build.ninja exists, yet SCons has not
 started executing, so files created here are in place before the first compile.
@@ -41,6 +50,18 @@ Import("env")  # noqa: F821  (injected by SCons)
 NINJA_TARGETS = [
     "esp-idf/morsemicro__halow/components/firmware/libmorsefirmware.a",
     "esp-idf/morsemicro__halow/components/morselib/libmorse.a",
+    "esp-idf/morsemicro__halow/components/mmpktmem/libmmpktmem.a",
+    "esp-idf/morsemicro__halow/components/mmutils/libmmutils.a",
+]
+
+# Archives the CMake file API does not surface, in the order they go on the link
+# line. liblibmorse.a (unmangled) is deliberately excluded: librarymangler.py
+# renames everything outside protected_syms.txt, so only the merged, mangled
+# libmorse.a resolves against the mmwlan_* symbols mmhalow.c calls.
+IMPORTED_ARCHIVES = [
+    "esp-idf/morsemicro__halow/components/morselib/libmorse.a",
+    "esp-idf/morsemicro__halow/components/mmpktmem/libmmpktmem.a",
+    "esp-idf/morsemicro__halow/components/mmutils/libmmutils.a",
 ]
 
 build_dir = Path(env.subst("$BUILD_DIR"))  # noqa: F821
@@ -92,3 +113,13 @@ if python_exe:
 ninja_exe = Path(env.PioPlatform().get_package_dir("tool-ninja") or "") / "ninja"  # noqa: F821
 print("halow_cmake_artifacts: building", ", ".join(NINJA_TARGETS))
 subprocess.check_call([str(ninja_exe), "-C", str(build_dir), *NINJA_TARGETS])
+
+# File nodes rather than plain strings: SCons turns a bare string in LIBS into
+# -l<name>, which ld then cannot find. LIBS lands in $_LIBFLAGS, last on the
+# link line, after every object and ESP-IDF archive that needs these symbols.
+#
+# --start-group cannot be expressed through LIBS for the same reason, so the
+# list is simply repeated instead: morselib and mmpktmem reference each other,
+# and a second pass resolves what the first left open.
+archives = [env.File(str(build_dir / a)) for a in IMPORTED_ARCHIVES]  # noqa: F821
+env.Append(LIBS=archives + archives)  # noqa: F821
